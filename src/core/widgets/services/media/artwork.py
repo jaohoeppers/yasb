@@ -211,6 +211,8 @@ class ArtworkMediaSessionCard(MediaSessionCard):
         content.setSpacing(0)
         heading = QHBoxLayout()
         heading.setSpacing(6)
+        if popup.config.media_menu.show_open_source_button:
+            heading.addSpacing(24)
         heading.addStretch()
         icon = (
             "\uf1bc"
@@ -226,6 +228,9 @@ class ArtworkMediaSessionCard(MediaSessionCard):
         self.title.setMaximumWidth(max(100, popup.config.media_menu.width - 150))
         heading.addWidget(self.title)
         heading.addStretch()
+        if popup.config.media_menu.show_open_source_button:
+            heading.addWidget(self.open_source_button)
+            self.open_source_button.show()
         content.addLayout(heading)
         content.addSpacing(12)
 

@@ -2,12 +2,13 @@
 
 import asyncio
 import math
+import time
 from functools import partial
 from typing import override
 
 from PIL.ImageQt import ImageQt
 from PyQt6.QtCore import QEvent, QObject, QPoint, QSignalBlocker, Qt, QTimer
-from PyQt6.QtGui import QHideEvent, QMouseEvent, QPainter, QPainterPath, QPixmap
+from PyQt6.QtGui import QCursor, QHideEvent, QMouseEvent, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -22,6 +23,9 @@ from PyQt6.QtWidgets import (
 
 from core.utils.stat_popup import PinnablePopup
 from core.utils.tooltip import set_tooltip
+from core.utils.win32.aumid import activate_app_by_aumid
+from core.utils.win32.aumid_process import get_process_name_for_aumid
+from core.utils.win32.bindings.user32 import GetAsyncKeyState
 from core.validation.widgets.yasb.audio_visualizer import AudioVisualizerConfig
 from core.validation.widgets.yasb.media import MediaWidgetConfig
 from core.widgets.services.media.media import SessionState, WindowsMedia
@@ -90,6 +94,13 @@ class MediaSessionCard(QFrame):
             )
             set_tooltip(self.visualizer, "System audio")
             heading.addWidget(self.visualizer)
+        self.open_source_button = self._button(
+            popup.config.media_menu_icons.open_source, "open-source-button", "Open application"
+        )
+        self.open_source_button.setFixedSize(24, 24)
+        self.open_source_button.setVisible(menu.show_open_source_button)
+        self.open_source_button.clicked.connect(self._open_source)
+        heading.addWidget(self.open_source_button)
         details.addLayout(heading)
         self.artist = label("", "artist")
         self.artist.setMinimumWidth(0)
@@ -165,6 +176,10 @@ class MediaSessionCard(QFrame):
     def _command(self, action: str) -> None:
         self.popup.command(self.session_id, action)
 
+    def _open_source(self) -> None:
+        opened = self.popup.open_source(self.session_id)
+        set_tooltip(self.open_source_button, "Open application" if opened else "Application window unavailable")
+
     def _begin_seek(self) -> None:
         self._seeking = True
 
@@ -196,6 +211,7 @@ class MediaSessionCard(QFrame):
 
     def update_state(self, state: SessionState) -> None:
         self.state = state
+        self.open_source_button.setEnabled(bool(state.app_id))
         menu = self.popup.config.media_menu
         title = state.title or "Unknown Title"
         self.title.setText(title[: menu.max_title_size] + "…" if len(title) > menu.max_title_size else title)
@@ -253,6 +269,11 @@ class MediaSessionsPopup(PinnablePopup):
         self.media = media
         self.config = config
         self.cards: dict[str, MediaSessionCard] = {}
+        self._source_focus_deadline = 0.0
+        self._source_mouse_pressed = False
+        self._source_watch_timer = QTimer(self)
+        self._source_watch_timer.setInterval(30)
+        self._source_watch_timer.timeout.connect(self._watch_source_clicks)
         self.volumes = AppVolumeController()
         self.setProperty("class", "media-menu native-media-menu")
         screen = parent.screen()
@@ -305,6 +326,43 @@ class MediaSessionsPopup(PinnablePopup):
 
     def command(self, session_id: str, action: str, position: float | None = None) -> None:
         asyncio.get_running_loop().create_task(self.media.control_session(session_id, action, position))
+
+    def open_source(self, session_id: str) -> bool:
+        state = self._last_sessions.get(session_id)
+        if state is None or not state.app_id:
+            return False
+        self.close_overlays()
+        # Activating another app deactivates this tool window. Consume only the
+        # resulting focus event; real outside clicks still follow normal dismissal.
+        self._source_focus_deadline = time.monotonic() + 1.0
+        try:
+            process_name = get_process_name_for_aumid(state.app_id)
+            opened = activate_app_by_aumid(state.app_id, fallback_process_name=process_name)
+        except Exception:
+            opened = False
+        if not opened:
+            self._source_focus_deadline = 0.0
+        else:
+            self._source_mouse_pressed = self._mouse_pressed()
+            self._source_watch_timer.start()
+        return opened
+
+    @staticmethod
+    def _mouse_pressed() -> bool:
+        return any(GetAsyncKeyState(key) & 0x8000 for key in (0x01, 0x02, 0x04))
+
+    def _watch_source_clicks(self) -> None:
+        # After activation the media app has focus, so Qt may not receive an
+        # outside click. Use the same native mouse-state approach as systray.
+        if not self.isVisible() or self._is_closing:
+            self._source_watch_timer.stop()
+            return
+        pressed = self._mouse_pressed()
+        new_press = pressed and not self._source_mouse_pressed
+        self._source_mouse_pressed = pressed
+        if new_press and not self.is_pinned and not self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+            self._source_watch_timer.stop()
+            self.hide_animated()
 
     def refresh(self, sessions: dict[str, SessionState] | None = None) -> None:
         if sessions is not None:
@@ -367,6 +425,17 @@ class MediaSessionsPopup(PinnablePopup):
             card.close_overlays()
 
     @override
+    def event(self, a0: QEvent | None) -> bool:
+        if (
+            a0 is not None
+            and a0.type() == QEvent.Type.WindowDeactivate
+            and self._source_focus_deadline > time.monotonic()
+        ):
+            self._source_focus_deadline = 0.0
+            return True
+        return super().event(a0)
+
+    @override
     def eventFilter(self, a0: QObject | None, a1: QEvent | None) -> bool:
         if isinstance(a1, QMouseEvent) and a1.type() == QEvent.Type.MouseButtonPress:
             for card in self.cards.values():
@@ -376,5 +445,7 @@ class MediaSessionsPopup(PinnablePopup):
     @override
     def hideEvent(self, a0: QHideEvent | None) -> None:
         self.volume_timer.stop()
+        self._source_watch_timer.stop()
+        self._source_focus_deadline = 0.0
         self.close_overlays()
         super().hideEvent(a0)

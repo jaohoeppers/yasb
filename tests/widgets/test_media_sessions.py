@@ -536,3 +536,139 @@ def test_wave_palette_is_only_sampled_when_artwork_changes(
     card.state.current_pos += 1
     card.update_state(card.state)
     choose.assert_called_once()
+
+
+@pytest.fixture
+def source_window(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    opened = Mock(return_value=True)
+    monkeypatch.setattr(popup_module, "activate_app_by_aumid", opened)
+    monkeypatch.setattr(popup_module, "get_process_name_for_aumid", Mock(return_value="player.exe"))
+    monkeypatch.setattr(popup_module, "GetAsyncKeyState", Mock(return_value=0))
+    return opened
+
+
+@pytest.mark.parametrize("layout", ["compact", "artwork"])
+def test_source_button_targets_its_paused_session_without_changing_selection(
+    widget: MediaWidget, source_window: Mock, monkeypatch: pytest.MonkeyPatch, layout: str, qapp: QApplication
+):
+    from core.widgets.services.media import artwork
+
+    monkeypatch.setattr(artwork, "ProgressWaveVisualizer", FakeVisualizer)
+    widget.config.media_menu.layout = cast(Any, layout)
+    widget.config.media_menu.show_open_source_button = True
+    widget.all_sessions["player"].is_playing = False
+    widget.setStyleSheet("""
+        .native-media-menu .btn { min-width: 26px; max-width: 26px; padding: 0; }
+        .native-media-menu .mute-button { min-width: 20px; max-width: 20px; padding: 0; }
+    """)
+    popup = open_popup(widget)
+    qapp.processEvents()
+    card = popup.cards["player"]
+    assert card.open_source_button.isVisible() and card.open_source_button.isEnabled()
+    position = card.open_source_button.mapTo(popup, card.open_source_button.rect().center())
+    assert popup.rect().contains(position), (
+        popup.rect(),
+        position,
+        card.geometry(),
+        card.open_source_button.geometry(),
+    )
+    mouse_click = cast(Any, QTest.mouseClick)
+    mouse_click(card.open_source_button, Qt.MouseButton.LeftButton)
+    source_window.assert_called_once_with("player.exe", fallback_process_name="player.exe")
+    assert widget.current_session is widget.all_sessions["chrome"]
+    assert popup.isVisible() and not popup._is_closing
+    assert popup._source_watch_timer.isActive()
+    popup.event(QEvent(QEvent.Type.WindowDeactivate))
+    assert popup.isVisible() and not popup._is_closing
+    assert popup._source_focus_deadline == 0
+    popup.hide()
+    assert not popup._source_watch_timer.isActive()
+
+
+def test_source_button_is_optional_and_handles_missing_app_id(widget: MediaWidget):
+    popup = open_popup(widget)
+    assert all(not card.open_source_button.isVisible() for card in popup.cards.values())
+    card = popup.cards["player"]
+    card.state.app_id = ""
+    card.update_state(card.state)
+    assert not card.open_source_button.isEnabled()
+    assert not popup.open_source("player")
+    assert not popup.open_source("removed")
+
+
+def test_missing_window_does_not_close_or_pin_the_panel(widget: MediaWidget, source_window: Mock):
+    source_window.return_value = False
+    popup = open_popup(widget)
+    assert not popup.open_source("player")
+    assert popup.isVisible() and not popup.is_pinned and not popup._is_closing
+    assert popup._source_focus_deadline == 0
+    assert not popup._source_watch_timer.isActive()
+
+
+def test_source_lookup_failure_is_handled_without_starting_or_relaunching_apps(
+    widget: MediaWidget, source_window: Mock, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        popup_module, "get_process_name_for_aumid", Mock(side_effect=RuntimeError("Window disappeared"))
+    )
+    popup = open_popup(widget)
+    assert not popup.open_source("player")
+    source_window.assert_not_called()
+    assert popup.isVisible() and not popup._source_watch_timer.isActive()
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_outside_click_after_source_activation_obeys_pin_state(
+    widget: MediaWidget, source_window: Mock, monkeypatch: pytest.MonkeyPatch, pinned: bool
+):
+    from PyQt6.QtCore import QPoint
+
+    popup = open_popup(widget)
+    popup.set_pinned(pinned)
+    assert popup.open_source("player")
+    popup.event(QEvent(QEvent.Type.WindowDeactivate))
+    monkeypatch.setattr(popup_module, "GetAsyncKeyState", Mock(return_value=0x8000))
+    monkeypatch.setattr(popup_module.QCursor, "pos", Mock(return_value=popup.mapToGlobal(QPoint(-20, -20))))
+    popup._watch_source_clicks()
+    assert popup._is_closing is not pinned
+
+
+def test_inside_click_after_source_activation_keeps_panel_open(
+    widget: MediaWidget, source_window: Mock, monkeypatch: pytest.MonkeyPatch
+):
+    from PyQt6.QtCore import QPoint
+
+    popup = open_popup(widget)
+    assert popup.open_source("player")
+    monkeypatch.setattr(popup_module, "GetAsyncKeyState", Mock(return_value=0x8000))
+    monkeypatch.setattr(popup_module.QCursor, "pos", Mock(return_value=popup.mapToGlobal(QPoint(20, 20))))
+    popup._watch_source_clicks()
+    assert popup.isVisible() and not popup._is_closing
+
+
+def test_source_focus_exception_expires_and_does_not_swallow_later_focus_changes(
+    widget: MediaWidget, source_window: Mock, monkeypatch: pytest.MonkeyPatch
+):
+    popup = open_popup(widget)
+    monkeypatch.setattr(popup_module.time, "monotonic", Mock(return_value=100.0))
+    assert popup.open_source("player")
+    monkeypatch.setattr(popup_module.time, "monotonic", Mock(return_value=102.0))
+    popup.event(QEvent(QEvent.Type.WindowDeactivate))
+    assert popup._is_closing
+
+
+@pytest.mark.parametrize("minimized", [False, True])
+def test_native_activation_restores_minimized_windows_before_focusing(monkeypatch: pytest.MonkeyPatch, minimized: bool):
+    from core.utils.win32 import aumid, window_actions
+
+    find = Mock(return_value=42)
+    restore = Mock()
+    foreground = Mock()
+    monkeypatch.setattr(aumid, "_find_window_by_aumid", find)
+    monkeypatch.setattr(aumid, "IsIconic", Mock(return_value=minimized))
+    monkeypatch.setattr(window_actions, "restore_window", restore)
+    monkeypatch.setattr(window_actions, "set_foreground", foreground)
+    assert aumid.activate_app_by_aumid("player-id", "player.exe")
+    find.assert_called_once_with("player-id", "player.exe")
+    assert restore.call_count == int(minimized)
+    foreground.assert_called_once_with(42)

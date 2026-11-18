@@ -23,6 +23,7 @@ class MediaMenuIconsConfig(CustomBaseModel):
     next_track: str = "\ue893"
     mute: str = "\ue994"
     unmute: str = "\ue74f"
+    open_source: str = "\ue8a7"
 
 
 class MediaMenuConfig(CustomBaseModel):
@@ -30,6 +31,7 @@ class MediaMenuConfig(CustomBaseModel):
     show_all_sessions: bool = False
     pinnable: bool = False
     show_visualizer: bool = False
+    show_open_source_button: bool = False
     width: int = Field(default=500, ge=360, le=1000)
     max_height: int = Field(default=600, ge=240, le=1200)
     blur: bool = True

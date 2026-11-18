@@ -259,6 +259,7 @@ Available actions:
   - **max_source_size:** The maximum size for the source app name in the popup.
   - **show_source:** Whether to show the media source in the popup. The name is resolved from Windows/app metadata (e.g. Spotify, Firefox).
   - **show_volume_slider:** Whether to show the volume slider in the popup. Volume control per application.
+  - **show_open_source_button:** Show an **Open application** button in each `compact` or `artwork` session card. Defaults to `false`. Restores and activates the application's existing window, including paused sessions, without changing the bar's selected session. The popup stays open; outside clicks still dismiss it unless pinned. Closed or unavailable windows are handled without launching a new application. For Chrome, this activates a browser window; selecting the exact media tab is not guaranteed.
 - **media_menu_icons:** A dictionary specifying the icons for the media menu popup. It contains
   - **play:** Icon for the play button in the popup.
   - **pause:** Icon for the pause button in the popup.
@@ -266,6 +267,7 @@ Available actions:
   - **next_track:** Icon for the next track button in the popup.
   - **mute:** Icon for the mute button in the popup.
   - **unmute:** Icon for the unmute button in the popup.
+  - **open_source:** Icon for the per-session Open application button (default `"\ue8a7"`). Style it with `.native-media-menu .open-source-button`.
 - **scrolling_label:** A dictionary specifying the scrolling label options for the widget.
   - **enabled:** Whether to enable the scrolling label.
   - **update_interval_ms:** The update interval for the scrolling label in milliseconds. Min 4 max 1000.
