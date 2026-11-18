@@ -1,7 +1,7 @@
 from collections.abc import Iterable, Sequence
 from typing import Protocol, override
 
-from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, Qt
+from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSignalBlocker, Qt
 from PyQt6.QtGui import (
     QBrush,
     QCloseEvent,
@@ -42,12 +42,33 @@ class PinnablePopup(PopupWidget):
         self._drag_pos: QPoint | None = None
         self.graph: GraphWidget | None = None
         self.stat_labels: dict[str, QLabel] = {}
+        self._pin_buttons: list[tuple[QPushButton, str, str]] = []
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.NoDropShadowWindowHint
         )
+
+    def create_pin_button(self, pin_icon: str = "\ue718", unpin_icon: str = "\ue77a") -> QPushButton:
+        button = QPushButton(pin_icon)
+        button.setCheckable(True)
+        button.setProperty("class", "pin-btn")
+        self._pin_buttons.append((button, pin_icon, unpin_icon))
+        button.toggled.connect(self.set_pinned)
+        self.set_pinned(self.is_pinned)
+        return button
+
+    def set_pinned(self, pinned: bool) -> None:
+        self.is_pinned = pinned
+        for button, pin_icon, unpin_icon in self._pin_buttons:
+            blocker = QSignalBlocker(button)
+            button.setChecked(pinned)
+            del blocker
+            button.setText(unpin_icon if pinned else pin_icon)
+            button.setProperty("class", "pin-btn pinned" if pinned else "pin-btn")
+            set_tooltip(button, "Unpin this window" if pinned else "Pin this window")
+            refresh_widget_style(button)
 
     @override
     def event(self, a0: QEvent | None) -> bool:
@@ -117,6 +138,8 @@ class GraphWidget(QFrame):
         self._line_path: QPainterPath | None = None
         self._fill_path: QPainterPath | None = None
         self._show_grid = show_grid
+        self._fill_enabled = True
+        self._color_bands: tuple[tuple[float, float, str], ...] = ()
         self.setMinimumHeight(20)
         self.setProperty("class", css_class)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -124,6 +147,15 @@ class GraphWidget(QFrame):
         self._grid_proxy = QFrame(self)
         self._grid_proxy.setProperty("class", f"{css_class}-grid")
         self._grid_proxy.setFixedSize(0, 0)
+
+    def set_fill_enabled(self, enabled: bool) -> None:
+        self._fill_enabled = enabled
+        self.update()
+
+    def set_color_bands(self, bands: Sequence[tuple[float, float, str]]) -> None:
+        """Color the existing smooth stroke by height; other charts retain their CSS color."""
+        self._color_bands = tuple(bands)
+        self.update()
 
     def set_data(self, data: list[float]) -> None:
         self._data = data
@@ -227,24 +259,54 @@ class GraphWidget(QFrame):
             if int(x + cell) > 0:
                 painter.drawLine(0, 0, 0, last_y)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Fill gradient
-        gradient = QLinearGradient(0, 0, 0, h)
-        fill_top = QColor(line_color)
-        fill_top.setAlpha(self.FILL_TOP_OPACITY)
-        fill_bottom = QColor(line_color)
-        fill_bottom.setAlpha(self.FILL_BOTTOM_OPACITY)
-        gradient.setColorAt(0, fill_top)
-        gradient.setColorAt(1, fill_bottom)
-        painter.setBrush(QBrush(gradient))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawPath(self._fill_path)
+        # The colored fill follows the same usage bands as the stroke, blending at thresholds.
+        if self._fill_enabled:
+            gradient = self._fill_gradient(line_color)
+            painter.setBrush(QBrush(gradient))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPath(self._fill_path)
         # Stroke line
         pen = QPen(line_color, self.STROKE_WIDTH)
         pen.setCapStyle(Qt.PenCapStyle.FlatCap)
         pen.setJoinStyle(Qt.PenJoinStyle.BevelJoin)
-        painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(self._line_path)
+        if not self._color_bands:
+            painter.setPen(pen)
+            painter.drawPath(self._line_path)
+        else:
+            pad = self.STROKE_WIDTH / 2
+            chart_h = h - pad * 2
+            for lower, upper, color in self._color_bands:
+                top = 0.0 if upper >= 100 else pad + chart_h * (1 - upper / 100)
+                bottom = float(h) if lower <= 0 else pad + chart_h * (1 - lower / 100)
+                painter.save()
+                painter.setClipRect(QRectF(0, top, float(w), max(0.0, bottom - top)))
+                pen.setColor(QColor(color))
+                painter.setPen(pen)
+                painter.drawPath(self._line_path)
+                painter.restore()
+
+    def _fill_gradient(self, fallback: QColor) -> QLinearGradient:
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        stops: list[tuple[float, str]]
+        if not self._color_bands:
+            stops = [(0.0, fallback.name(QColor.NameFormat.HexArgb)), (1.0, fallback.name(QColor.NameFormat.HexArgb))]
+        else:
+            stops = [(0.0, self._color_bands[-1][2]), (1.0, self._color_bands[0][2])]
+            pad = self.STROKE_WIDTH / 2
+            height = max(1, self.height())
+            chart_h = height - pad * 2
+            for index in range(1, len(self._color_bands)):
+                lower, upper, color = self._color_bands[index]
+                previous_lower, _, previous_color = self._color_bands[index - 1]
+                boundary = (pad + chart_h * (1 - lower / 100)) / height
+                width = min(2.5, (upper - lower) / 2, (lower - previous_lower) / 2) * chart_h / height / 100
+                stops.extend([(max(0.0, boundary - width), color), (min(1.0, boundary + width), previous_color)])
+        for position, value in sorted(stops):
+            color = QColor(value)
+            color.setAlpha(round(self.FILL_TOP_OPACITY + (self.FILL_BOTTOM_OPACITY - self.FILL_TOP_OPACITY) * position))
+            gradient.setColorAt(position, color)
+        return gradient
 
 
 class StatPopupMenuConfig(Protocol):
@@ -285,6 +347,7 @@ def build_stat_popup(
     history: Iterable[float],
     stat_rows: Sequence[StatRow],
     graph_class: str = "graph",
+    primary_stats: Sequence[str] = (),
 ) -> PinnablePopup:
 
     popup = PinnablePopup(
@@ -311,19 +374,7 @@ def build_stat_popup(
 
     pin_icon = menu_config.pin_icon
     unpin_icon = menu_config.unpin_icon
-    pin_btn = QPushButton(pin_icon)
-    pin_btn.setCheckable(True)
-    pin_btn.setProperty("class", "pin-btn")
-    set_tooltip(pin_btn, "Pin this window")
-
-    def on_pin_toggled(checked: bool):
-        pin_btn.setText(unpin_icon if checked else pin_icon)
-        pin_btn.setProperty("class", "pin-btn pinned" if checked else "pin-btn")
-        set_tooltip(pin_btn, "Pin this window" if not checked else "Unpin this window")
-        refresh_widget_style(pin_btn)
-        popup.is_pinned = checked
-
-    pin_btn.toggled.connect(on_pin_toggled)
+    pin_btn = popup.create_pin_button(pin_icon, unpin_icon)
     header_layout.addWidget(pin_btn)
     layout.addWidget(header)
 
@@ -362,15 +413,16 @@ def build_stat_popup(
                 continue
             align = Qt.AlignmentFlag.AlignRight if is_right else Qt.AlignmentFlag.AlignLeft
             item = QFrame()
-            item.setProperty("class", "stat-item")
+            primary_class = " primary" if key in primary_stats else ""
+            item.setProperty("class", f"stat-item{primary_class}")
             item_layout = QVBoxLayout(item)
             item_layout.setContentsMargins(0, 0, 0, 0)
             item_layout.setSpacing(0)
             header_label = QLabel(header_text)
-            header_label.setProperty("class", "stat-label")
+            header_label.setProperty("class", f"stat-label{primary_class}")
             header_label.setAlignment(align)
             value_label = QLabel(value)
-            value_label.setProperty("class", "stat-value")
+            value_label.setProperty("class", f"stat-value{primary_class}")
             value_label.setAlignment(align)
             item_layout.addWidget(header_label)
             item_layout.addWidget(value_label)

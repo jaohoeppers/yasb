@@ -2,7 +2,7 @@ import re
 from collections import deque
 
 from humanize import naturalsize
-from PyQt6.QtWidgets import QFrame, QLabel, QVBoxLayout
+from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout
 
 from core.utils.stat_popup import GraphWidget, PinnablePopup, StatRow, build_stat_popup
 from core.utils.utilities import (
@@ -12,7 +12,10 @@ from core.utils.utilities import (
 )
 from core.validation.widgets.yasb.gpu import GpuConfig
 from core.widgets.base import BaseWidget
+from core.widgets.services.cooling.libre import gpu_fans
+from core.widgets.services.cooling.view import CoolingSection
 from core.widgets.services.gpu.gpu_api import GpuData, GpuWorker
+from core.widgets.services.temperature.libre import TemperatureSnapshot, TemperatureWorker
 
 
 class GpuWidget(BaseWidget):
@@ -25,6 +28,8 @@ class GpuWidget(BaseWidget):
     def __init__(self, config: GpuConfig):
         super().__init__(class_name=f"gpu-widget {config.class_name}")
         self.config = config
+        self._cooling: CoolingSection | None = None
+        self._fan_snapshot: TemperatureSnapshot | None = None
         self._gpu_util_history = deque([0.0] * config.histogram_num_columns, maxlen=config.histogram_num_columns)
         self._gpu_mem_history = deque([0.0] * config.histogram_num_columns, maxlen=config.histogram_num_columns)
         self._show_alt_label = False
@@ -32,6 +37,12 @@ class GpuWidget(BaseWidget):
         self._history: deque[float] = deque(maxlen=config.menu.graph_history_size)
         self._temp_history: deque[float] = deque(maxlen=config.menu.graph_history_size)
         self._popup_temp_graph: GraphWidget | None = None
+        self._available_gpus: dict[str, GpuData] = {}
+        self._selected_id: str | None = None
+        self._adapter_histories: dict[str, deque[float]] = {}
+        self._adapter_temp_histories: dict[str, deque[float]] = {}
+        self._selector_buttons: dict[str, QPushButton] = {}
+        self._memory_bars: dict[str, QProgressBar] = {}
 
         self.progress_widget = None
         self.progress_widget = build_progress_widget(self, self.config.progress_bar.model_dump())
@@ -54,12 +65,39 @@ class GpuWidget(BaseWidget):
         if self.config.update_interval > 0:
             worker = GpuWorker.get_instance(self.config.update_interval)
             worker.add_index(self.config.gpu_index)
+            if self.config.menu.adapter_selector:
+                worker.enable_selector()
+            if self.config.menu.show_clocks:
+                worker.enable_clocks(self.config.libre_host, self.config.libre_port, self.config.libre_sensor_map)
             if GpuWidget._worker is None:
                 worker.data_ready.connect(GpuWidget._on_gpu_data)
                 worker.start()
                 GpuWidget._worker = worker
 
         self._show_placeholder()
+        if config.menu.show_fan_rpm:
+            fan_worker = TemperatureWorker.get_instance(config.libre_host, config.libre_port, 1000, 120)
+            self._fan_snapshot = fan_worker.latest
+            fan_worker.data_ready.connect(self._receive_cooling)
+            if not fan_worker.isRunning():
+                fan_worker.start()
+
+    def _receive_cooling(self, snapshot: TemperatureSnapshot) -> None:
+        self._fan_snapshot = snapshot
+        popup = PopupWidget.open_popup_for(self)
+        if isinstance(popup, PinnablePopup) and popup.isVisible() and self._cooling is not None:
+            self._update_cooling(self._last_gpu_data)
+            popup.adjustSize()
+
+    def _update_cooling(self, data: GpuData | None) -> None:
+        if self._cooling is not None:
+            readings = self._fan_snapshot.fans if self._fan_snapshot is not None else ()
+            fans = (
+                gpu_fans(readings, data.name, self.config.libre_sensor_map.get(data.gpu_index))
+                if data is not None
+                else ()
+            )
+            self._cooling.update_readings(fans)
 
     def _show_placeholder(self):
         """Display placeholder (zero/default) GPU data."""
@@ -83,6 +121,9 @@ class GpuWidget(BaseWidget):
         """Slot called on main thread when GPU worker emits data."""
         for inst in cls._instances[:]:
             try:
+                if inst.config.menu.adapter_selector:
+                    inst._receive_adapters(gpu_data_list)
+                    continue
                 gpu_data = next((g for g in gpu_data_list if g.gpu_index == inst.config.gpu_index), None)
                 if gpu_data:
                     if inst.isHidden():
@@ -96,6 +137,52 @@ class GpuWidget(BaseWidget):
                     inst.hide()
             except RuntimeError:
                 cls._instances.remove(inst)
+
+    @staticmethod
+    def _adapter_key(data: GpuData) -> str:
+        return data.adapter_id or f"index:{data.gpu_index}"
+
+    def _ordered_adapters(self) -> list[str]:
+        data = list(self._available_gpus.values())
+        if self.config.menu.adapter_order == "dedicated_first":
+            data.sort(key=lambda item: (-item.mem_total, item.name, self._adapter_key(item)))
+        else:
+            data.sort(key=lambda item: item.gpu_index)
+        return [self._adapter_key(item) for item in data]
+
+    def _receive_adapters(self, samples: list[GpuData]) -> None:
+        self._available_gpus = {self._adapter_key(item): item for item in samples}
+        for key, item in self._available_gpus.items():
+            self._adapter_histories.setdefault(key, deque(maxlen=self.config.menu.graph_history_size)).append(
+                item.utilization
+            )
+            self._adapter_temp_histories.setdefault(key, deque(maxlen=self.config.menu.graph_history_size)).append(
+                item.temp
+            )
+        ordered = self._ordered_adapters()
+        if not ordered:
+            return
+        if self._selected_id not in self._available_gpus:
+            self._selected_id = ordered[min(self.config.gpu_index, len(ordered) - 1)]
+        self._select_adapter(self._selected_id)
+
+    def _select_adapter(self, identifier: str) -> None:
+        data = self._available_gpus.get(identifier)
+        if data is None:
+            return
+        self._selected_id = identifier
+        self._history = self._adapter_histories[identifier]
+        self._temp_history = self._adapter_temp_histories[identifier]
+        self._update_label(data)
+        self._update_popup(data)
+
+    @staticmethod
+    def _clock_text(value: float | None) -> str:
+        return f"{value:.0f} MHz" if value is not None else "\u2014"
+
+    @classmethod
+    def _combined_text(cls, data: GpuData) -> str:
+        return f"{cls._format_popup_size(data.mem_used + data.mem_shared_used)} / {cls._format_popup_size(data.mem_total + data.mem_shared_total)}"
 
     def _update_label(self, gpu_data: GpuData):
         """Update the label with GPU data."""
@@ -185,6 +272,7 @@ class GpuWidget(BaseWidget):
         if not isinstance(popup, PinnablePopup) or not popup.isVisible():
             return
         try:
+            self._update_cooling(gpu_data)
             if popup.graph is not None:
                 popup.graph.set_data(list(self._history))
             if self._popup_temp_graph is not None:
@@ -194,7 +282,7 @@ class GpuWidget(BaseWidget):
             labels["usage"].setText(f"{gpu_data.utilization:.0f}%")
             labels["mem"].setText(f"{format_size(gpu_data.mem_used)} / {format_size(gpu_data.mem_total)}")
             if "temp" in labels:
-                labels["temp"].setText(f"{gpu_data.temp}°C")
+                labels["temp"].setText(f"{gpu_data.temp}°C" if gpu_data.temp > 0 else "\u2014")
             if "power" in labels:
                 labels["power"].setText(f"{gpu_data.power_draw:.1f} W")
             if "fan" in labels:
@@ -203,6 +291,24 @@ class GpuWidget(BaseWidget):
                 labels["mem_shared"].setText(
                     f"{format_size(gpu_data.mem_shared_used)} / {format_size(gpu_data.mem_shared_total)}"
                 )
+            if "mem_combined" in labels:
+                labels["mem_combined"].setText(self._combined_text(gpu_data))
+            if "core_clock" in labels:
+                labels["core_clock"].setText(self._clock_text(gpu_data.core_clock))
+                labels["memory_clock"].setText(self._clock_text(gpu_data.memory_clock))
+            for key, used, capacity in (
+                ("mem", gpu_data.mem_used, gpu_data.mem_total),
+                ("mem_shared", gpu_data.mem_shared_used, gpu_data.mem_shared_total),
+                (
+                    "mem_combined",
+                    gpu_data.mem_used + gpu_data.mem_shared_used,
+                    gpu_data.mem_total + gpu_data.mem_shared_total,
+                ),
+            ):
+                if key in self._memory_bars:
+                    self._memory_bars[key].setValue(min(1000, max(0, round(used / capacity * 1000))) if capacity else 0)
+            for identifier, button in self._selector_buttons.items():
+                button.setChecked(identifier == self._selected_id)
         except Exception:
             pass
 
@@ -211,20 +317,23 @@ class GpuWidget(BaseWidget):
         if not self.config.menu.enabled:
             return
         menu = self.config.menu
+        if menu.adapter_selector and self._available_gpus:
+            ordered = self._ordered_adapters()
+            self._select_adapter(ordered[min(self.config.gpu_index, len(ordered) - 1)])
         data = self._last_gpu_data
         format_size = self._format_popup_size
 
-        has_temp = data is not None and data.temp > 0
-        has_power = data is not None and data.power_draw > 0
-        has_fan = data is not None and (data.fan_speed > 0 or has_temp)
-        has_shared = data is not None and data.mem_shared_total > 0
+        has_temp = menu.show_temperature and data is not None and data.temp > 0
+        has_power = menu.show_power and data is not None and data.power_draw > 0
+        has_fan = menu.show_fan_speed and data is not None and (data.fan_speed > 0 or has_temp)
+        has_shared = data is not None and (data.mem_shared_total > 0 or menu.show_combined_memory)
 
         stat_rows: list[StatRow] = [
             (
                 "Usage",
                 "usage",
                 f"{data.utilization:.0f}%" if data else "\u2014",
-                "Memory",
+                "In Use",
                 "mem",
                 f"{format_size(data.mem_used)} / {format_size(data.mem_total)}" if data else "\u2014",
             ),
@@ -254,6 +363,33 @@ class GpuWidget(BaseWidget):
                 )
             )
 
+        if menu.show_combined_memory:
+            # Retain the native two-column cards, with all three memory amounts represented.
+            stat_rows = [row for row in stat_rows if row[4] != "mem_shared"]
+            if has_fan and data is not None:
+                stat_rows.append(("Fan speed", "fan", f"{data.fan_speed}%", None, "unused", ""))
+            stat_rows.append(
+                (
+                    "Shared memory",
+                    "mem_shared",
+                    f"{format_size(data.mem_shared_used)} / {format_size(data.mem_shared_total)}" if data else "\u2014",
+                    "Combined memory",
+                    "mem_combined",
+                    self._combined_text(data) if data else "\u2014",
+                )
+            )
+        if menu.show_clocks:
+            stat_rows.append(
+                (
+                    "Core clock",
+                    "core_clock",
+                    self._clock_text(data.core_clock if data else None),
+                    "Memory clock",
+                    "memory_clock",
+                    self._clock_text(data.memory_clock if data else None),
+                )
+            )
+
         popup = build_stat_popup(
             parent=self,
             menu_config=menu,
@@ -262,11 +398,48 @@ class GpuWidget(BaseWidget):
             history=self._history,
             stat_rows=stat_rows,
             graph_class="gpu-graph",
+            primary_stats=("usage",) if menu.highlight_usage else (),
         )
 
         # Add title label above the utilization graph container
         main_layout = popup.layout()
+        self._selector_buttons = {}
+        self._memory_bars = {}
+        if menu.adapter_selector and self._available_gpus and isinstance(main_layout, QVBoxLayout):
+            header_item = main_layout.itemAt(0)
+            header = header_item.widget() if header_item is not None else None
+            header_layout = header.layout() if header is not None else None
+            if isinstance(header_layout, QHBoxLayout):
+                for position, identifier in enumerate(self._ordered_adapters()):
+                    button = QPushButton(f"GPU {position}")
+                    button.setProperty("class", "adapter-button")
+                    button.setCheckable(True)
+                    button.setChecked(identifier == self._selected_id)
+                    button.setToolTip(self._available_gpus[identifier].name)
+
+                    def select(_checked: bool = False, key: str = identifier) -> None:
+                        self._select_adapter(key)
+
+                    button.clicked.connect(select)
+                    header_layout.insertWidget(header_layout.count() - 1, button)
+                    self._selector_buttons[identifier] = button
+        if menu.show_memory_bars:
+            for key in ("mem", "mem_shared", "mem_combined"):
+                label = popup.stat_labels.get(key)
+                card = label.parentWidget() if label is not None else None
+                card_layout = card.layout() if card is not None else None
+                if isinstance(card_layout, QVBoxLayout):
+                    bar = QProgressBar()
+                    bar.setProperty("class", "memory-bar")
+                    bar.setRange(0, 1000)
+                    bar.setTextVisible(False)
+                    card_layout.addWidget(bar)
+                    self._memory_bars[key] = bar
+            combined_label = popup.stat_labels.get("mem_combined")
+            if combined_label is not None:
+                combined_label.setToolTip("Dedicated memory + shared system RAM limit; not additional physical VRAM.")
         if menu.show_graph and popup.graph is not None:
+            popup.graph.set_fill_enabled(menu.show_graph_fill)
             graph_container = popup.graph.parentWidget()
             if isinstance(main_layout, QVBoxLayout) and graph_container is not None:
                 graph_idx = main_layout.indexOf(graph_container)
@@ -290,6 +463,7 @@ class GpuWidget(BaseWidget):
             temp_layout.setContentsMargins(0, 0, 0, 0)
             temp_layout.setSpacing(0)
             temp_graph = GraphWidget("gpu-temp-graph", show_grid=menu.show_graph_grid)
+            temp_graph.set_fill_enabled(menu.show_graph_fill)
             temp_layout.addWidget(temp_graph)
             if self._temp_history:
                 temp_graph.set_data(list(self._temp_history))
@@ -297,7 +471,14 @@ class GpuWidget(BaseWidget):
 
             self._popup_temp_graph = temp_graph
 
+        if menu.show_fan_rpm and isinstance(main_layout, QVBoxLayout):
+            self._cooling = CoolingSection()
+            self._update_cooling(data)
+            main_layout.addWidget(self._cooling)
+            popup.adjustSize()
         popup.show()
+        if data is not None:
+            self._update_popup(data)
 
     @staticmethod
     def _format_popup_size(value: float) -> str:
